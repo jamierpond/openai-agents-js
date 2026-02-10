@@ -151,3 +151,4 @@ bundled/
 
 .wrangler/
 .dev.vars
+packages/agents-core/dist
