@@ -97,6 +97,7 @@ export class OpenAIRealtimeWebRTC
   #ongoingResponse: boolean = false;
   #muted = false;
   #connectPromise: Promise<void> | undefined;
+  #connectAttemptId = 0;
 
   constructor(private readonly options: OpenAIRealtimeWebRTCOptions = {}) {
     if (typeof RTCPeerConnection === 'undefined') {
@@ -172,6 +173,7 @@ export class OpenAIRealtimeWebRTC
       );
     }
 
+    const attemptId = ++this.#connectAttemptId;
     // eslint-disable-next-line no-async-promise-executor
     this.#connectPromise = new Promise<void>(async (resolve, reject) => {
       try {
@@ -223,10 +225,12 @@ export class OpenAIRealtimeWebRTC
           // Without this, audio can flow to the server before config (instructions,
           // tools, modalities) is applied, causing the server to use defaults.
           let resolved = false;
+          // eslint-disable-next-line prefer-const -- declared before finish() to avoid TDZ if a callback fires synchronously
+          let timeoutId: ReturnType<typeof setTimeout> | undefined;
           const finish = () => {
             if (resolved) return;
             resolved = true;
-            clearTimeout(timeoutId);
+            if (timeoutId !== undefined) clearTimeout(timeoutId);
             dataChannel.removeEventListener('message', onConfigAck);
             dataChannel.removeEventListener('close', onClose);
             // Reject if the transport was closed/errored while waiting,
@@ -269,9 +273,7 @@ export class OpenAIRealtimeWebRTC
           const onClose = () => {
             finish();
           };
-          // Start the timeout before wiring callbacks so that timeoutId
-          // is initialized if a listener fires synchronously.
-          const timeoutId = setTimeout(() => {
+          timeoutId = setTimeout(() => {
             if (!resolved) {
               logger.warn(
                 'Timed out waiting for session.updated ack — resolving connect() anyway',
@@ -281,6 +283,34 @@ export class OpenAIRealtimeWebRTC
           }, 5000);
           dataChannel.addEventListener('message', onConfigAck);
           dataChannel.addEventListener('close', onClose);
+
+          // Register the general message handler AFTER onConfigAck so that
+          // finish() resolves connect() before _onMessage emits the
+          // session.updated event to external listeners.
+          dataChannel.addEventListener('message', (event) => {
+            this._onMessage(event);
+            const { data: parsed, isGeneric } = parseRealtimeEvent(event);
+            if (!parsed || isGeneric) {
+              return;
+            }
+
+            if (parsed.type === 'response.created') {
+              this.#ongoingResponse = true;
+            } else if (parsed.type === 'response.done') {
+              this.#ongoingResponse = false;
+            }
+
+            if (parsed.type === 'session.created') {
+              this._tracingConfig = parsed.session.tracing;
+              // Trying to turn on tracing after the session is created
+              const tracingConfig =
+                typeof userSessionConfig.tracing === 'undefined'
+                  ? 'auto'
+                  : userSessionConfig.tracing;
+              this._updateTracingConfig(tracingConfig);
+            }
+          });
+
           this.updateSessionConfig(userSessionConfig);
         });
 
@@ -288,30 +318,6 @@ export class OpenAIRealtimeWebRTC
           this.close();
           this._onError(event);
           reject(event);
-        });
-
-        dataChannel.addEventListener('message', (event) => {
-          this._onMessage(event);
-          const { data: parsed, isGeneric } = parseRealtimeEvent(event);
-          if (!parsed || isGeneric) {
-            return;
-          }
-
-          if (parsed.type === 'response.created') {
-            this.#ongoingResponse = true;
-          } else if (parsed.type === 'response.done') {
-            this.#ongoingResponse = false;
-          }
-
-          if (parsed.type === 'session.created') {
-            this._tracingConfig = parsed.session.tracing;
-            // Trying to turn on tracing after the session is created
-            const tracingConfig =
-              typeof userSessionConfig.tracing === 'undefined'
-                ? 'auto'
-                : userSessionConfig.tracing;
-            this._updateTracingConfig(tracingConfig);
-          }
         });
 
         // set up audio playback
@@ -373,7 +379,11 @@ export class OpenAIRealtimeWebRTC
         reject(error);
       }
     }).finally(() => {
-      this.#connectPromise = undefined;
+      // Only clear if this is still the active connection attempt.
+      // A newer connect() may have already replaced #connectPromise.
+      if (this.#connectAttemptId === attemptId) {
+        this.#connectPromise = undefined;
+      }
     });
     return this.#connectPromise;
   }
