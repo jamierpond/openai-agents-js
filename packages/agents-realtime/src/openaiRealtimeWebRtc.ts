@@ -96,6 +96,7 @@ export class OpenAIRealtimeWebRTC
   #useInsecureApiKey: boolean;
   #ongoingResponse: boolean = false;
   #muted = false;
+  #connectPromise: Promise<void> | undefined;
 
   constructor(private readonly options: OpenAIRealtimeWebRTCOptions = {}) {
     if (typeof RTCPeerConnection === 'undefined') {
@@ -150,9 +151,13 @@ export class OpenAIRealtimeWebRTC
     }
 
     if (this.#state.status === 'connecting') {
+      if (this.#connectPromise) {
+        return this.#connectPromise;
+      }
       logger.warn(
-        'Realtime connection already in progress. Please await original promise',
+        'Realtime connection already in progress but no promise found',
       );
+      return;
     }
 
     const model = options.model ?? this.currentModel;
@@ -168,7 +173,7 @@ export class OpenAIRealtimeWebRTC
     }
 
     // eslint-disable-next-line no-async-promise-executor
-    return new Promise<void>(async (resolve, reject) => {
+    this.#connectPromise = new Promise<void>(async (resolve, reject) => {
       try {
         const userSessionConfig: Partial<RealtimeSessionConfig> = {
           ...(options.initialSessionConfig || {}),
@@ -208,7 +213,7 @@ export class OpenAIRealtimeWebRTC
 
         dataChannel.addEventListener('open', () => {
           this.#state = {
-            status: 'connected',
+            status: 'connecting',
             peerConnection,
             dataChannel,
             callId,
@@ -221,7 +226,36 @@ export class OpenAIRealtimeWebRTC
           const finish = () => {
             if (resolved) return;
             resolved = true;
+            clearTimeout(timeoutId);
             dataChannel.removeEventListener('message', onConfigAck);
+            dataChannel.removeEventListener('close', onClose);
+            // Reject if the transport was closed/errored while waiting,
+            // the dataChannel is no longer open, or a different connection
+            // attempt is now active (stale timeout from an earlier connect).
+            if (
+              this.#state.status !== 'connecting' ||
+              this.#state.dataChannel !== dataChannel ||
+              dataChannel.readyState !== 'open'
+            ) {
+              // Transition to disconnected if this attempt is still the
+              // active one so that callers can retry connect() without
+              // needing to call close() first.
+              if (this.#state.dataChannel === dataChannel) {
+                this.close();
+              }
+              reject(
+                new Error(
+                  'Connection closed before session config was acknowledged',
+                ),
+              );
+              return;
+            }
+            this.#state = {
+              status: 'connected',
+              peerConnection,
+              dataChannel,
+              callId,
+            };
             this.emit('connection_change', this.#state.status);
             this._onOpen();
             resolve();
@@ -232,10 +266,12 @@ export class OpenAIRealtimeWebRTC
               finish();
             }
           };
-          dataChannel.addEventListener('message', onConfigAck);
-          this.updateSessionConfig(userSessionConfig);
-          // Hard timeout — if the server never acks, don't hang forever.
-          setTimeout(() => {
+          const onClose = () => {
+            finish();
+          };
+          // Start the timeout before wiring callbacks so that timeoutId
+          // is initialized if a listener fires synchronously.
+          const timeoutId = setTimeout(() => {
             if (!resolved) {
               logger.warn(
                 'Timed out waiting for session.updated ack — resolving connect() anyway',
@@ -243,6 +279,9 @@ export class OpenAIRealtimeWebRTC
               finish();
             }
           }, 5000);
+          dataChannel.addEventListener('message', onConfigAck);
+          dataChannel.addEventListener('close', onClose);
+          this.updateSessionConfig(userSessionConfig);
         });
 
         dataChannel.addEventListener('error', (event) => {
@@ -333,7 +372,10 @@ export class OpenAIRealtimeWebRTC
         this._onError(error);
         reject(error);
       }
+    }).finally(() => {
+      this.#connectPromise = undefined;
     });
+    return this.#connectPromise;
   }
 
   /**
