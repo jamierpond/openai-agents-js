@@ -334,7 +334,13 @@ export class OpenAIRealtimeWebRTC
           (await navigator.mediaDevices.getUserMedia({
             audio: true,
           }));
-        peerConnection.addTrack(stream.getAudioTracks()[0]);
+        const audioTrack = stream.getAudioTracks()[0];
+        // Apply pre-connect mute state — mute() may have been called before
+        // connect(), so the track needs to respect the stored #muted flag.
+        if (this.#muted) {
+          audioTrack.enabled = false;
+        }
+        peerConnection.addTrack(audioTrack);
 
         if (this.options.changePeerConnection) {
           const originalPeerConnection = peerConnection;
