@@ -566,10 +566,24 @@ export class RealtimeSession<
     this.#context.context.history = JSON.parse(JSON.stringify(this.#history)); // deep copy of the history
     let parsedArgs: any = toolCall.arguments;
     if (tool.parameters) {
-      if (isZodObject(tool.parameters)) {
-        parsedArgs = tool.parameters.parse(parsedArgs);
-      } else {
-        parsedArgs = JSON.parse(parsedArgs);
+      try {
+        if (isZodObject(tool.parameters)) {
+          parsedArgs = tool.parameters.parse(parsedArgs);
+        } else {
+          parsedArgs = JSON.parse(parsedArgs);
+        }
+      } catch (parseError: any) {
+        // Send the validation error back to the model so it can self-correct
+        const errorDetail = parseError?.issues
+          ? parseError.issues
+              .map((i: any) => `${i.path.join('.')}: ${i.message}`)
+              .join('; ')
+          : (parseError?.message ?? 'Unknown validation error');
+        const errorMessage = JSON.stringify({
+          error: `Invalid input for tool "${tool.name}": ${errorDetail}`,
+        });
+        this.#transport.sendFunctionCallOutput(toolCall, errorMessage, true);
+        return;
       }
     }
     const needsApproval = await tool.needsApproval(
